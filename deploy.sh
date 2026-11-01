@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# Деплой бэкенда DIAS одной командой (запускать на сервере из /root/DIas_ERP):
+#   ./deploy.sh            — бэкап БД → код из origin/main → сборка → запуск → проверка health
+#   ./deploy.sh --no-pull  — без обновления кода (собрать то, что уже лежит в папке)
+set -euo pipefail
+
+cd "$(dirname "$0")"
+
+COMPOSE="docker compose --env-file .env.prod -f docker-compose.prod.yml"
+
+log()  { echo -e "\033[1;34m[deploy]\033[0m $*"; }
+fail() { echo -e "\033[1;31m[deploy] ОШИБКА:\033[0m $*" >&2; exit 1; }
+
+# ——— Проверки окружения ———
+command -v docker >/dev/null || fail "docker не установлен"
+docker compose version >/dev/null 2>&1 || fail "нет плагина docker compose"
+
+if [ ! -f .env.prod ]; then
+    cp .env.prod.example .env.prod
+    fail "создан .env.prod из шаблона — заполните DJANGO_SECRET_KEY и PGPASSWORD и запустите снова"
+fi
+grep -q 'CHANGE_ME' .env.prod && fail "в .env.prod остались значения CHANGE_ME"
+
+# Порт контейнерного nginx из HTTP_PORT (формат «8080» или «127.0.0.1:8080»).
+# `|| true` — если строки нет в .env.prod, grep вернёт 1 и уронит весь скрипт
+# из-за set -e/pipefail; переменная просто останется пустой, ниже дефолт :-80.
+http_port="$(grep -E '^HTTP_PORT=' .env.prod | tail -1 | cut -d= -f2 | awk -F: '{print $NF}' || true)"
+HEALTH_URL="http://127.0.0.1:${http_port:-80}/health/"
+
+mkdir -p frontend-dist backups
+
+# Том БД объявлен в compose как external (защита от `docker compose down -v`) —
+# compose сам его больше не создаёт, на чистом сервере создаём вручную.
+docker volume inspect dias_pg_data >/dev/null 2>&1 || docker volume create dias_pg_data >/dev/null
+[ -f frontend-dist/index.html ] || log "frontend-dist/ пустая — залейте билд фронта (Dias_Front/deploy.sh)"
+
+# MEDIA_DIR — путь хоста для загруженных файлов (см. MEDIA_DIR в docker-compose.prod.yml
+# и location /media/ в /etc/nginx/sites-enabled/diyas — оба должны указывать сюда же).
+# a+rwX — backend пишет туда под системным пользователем dias (не root), без этого
+# ловит permission denied при создании подпапок.
+media_dir="$(grep -E '^MEDIA_DIR=' .env.prod 2>/dev/null | tail -1 | cut -d= -f2 || true)"
+media_dir="${media_dir:-/opt/dias/backend/media}"
+mkdir -p "$media_dir"
+chmod -R a+rwX "$media_dir"
+
+# ——— Бэкап БД (если контейнер БД уже работает) ———
+if $COMPOSE ps --status running --services 2>/dev/null | grep -qx db; then
+    # Проверяет дамп и ротирует старые; упадёт — деплой дальше не пойдёт.
+    ./scripts/backup.sh || fail "бэкап не получился — деплой остановлен, база не тронута"
+else
+    log "БД ещё не запущена — бэкап пропущен (первый деплой)"
+fi
+
+# ——— Код ———
+if [ "${1:-}" != "--no-pull" ]; then
+    # Явно origin/main: не зависим от имени локальной ветки и её upstream.
+    # .env.prod, frontend-dist/, backups/ не в git — reset их не трогает.
+    log "обновление кода из origin/main"
+    git fetch origin main
+    git checkout -q -B main origin/main
+    git reset -q --hard origin/main
+fi
+
+# ——— Сборка и запуск ———
+log "сборка и запуск контейнеров"
+$COMPOSE up -d --build --remove-orphans
+
+# ——— Проверка ———
+log "ожидание health-check"
+for i in $(seq 1 30); do
+    if curl -fsS "$HEALTH_URL" >/dev/null 2>&1; then
+        $COMPOSE ps
+        log "готово: $(curl -fsS "$HEALTH_URL")"
+        docker image prune -f >/dev/null
+        # кэш сборки иначе растёт на каждом деплое (на 14 ГБ диске набегало 2+ ГБ);
+        # свежий оставляем, чтобы следующая сборка шла быстро
+        docker builder prune -f --filter until=24h >/dev/null
+        exit 0
+    fi
+    sleep 3
+done
+
+$COMPOSE ps
+$COMPOSE logs --tail=50 backend
+fail "бэкенд не ответил на $HEALTH_URL за 90 с — логи выше"
